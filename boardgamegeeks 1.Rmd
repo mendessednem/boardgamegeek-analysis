@@ -1,0 +1,927 @@
+---
+title: "Análise do Board Games Dataset (BGDB)"
+author: 'Cesae Digital | Cátia Silva '
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '2'
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    number_sections: true
+---
+
+<style>
+p, li {
+  text-align: justify;
+}
+</style>
+
+O presente notebook descreve uma pipeline de análise de dados aplicada ao dataset *Board Game Database from BoardGameGeek (BGDB)*, obtido via Kaggle. Inicialmente, é realizada a preparação do dataset (importação, harmonização de variáveis e tratamento de inconsistências), seguida de análises exploratórias de BI (univariada, bivariada e multivariada). Posteriormente, são construídos modelos de BA para previsão do rating médio e classificação de jogos de topo. Por fim, é desenvolvido um sistema de recomendação baseado em conteúdo, demonstrando uma abordagem prescritiva orientada ao apoio à decisão.  
+
+# Importação e preparação do dataset
+
+Antes de qualquer análise, é fundamental compreender a estrutura do dataset e garantir a consistência das variáveis.
+
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(corrplot)
+library(factoextra)
+library(pROC)
+library(rpart)
+library(randomForest)
+library(caret)
+library(ggplot2)
+library(xgboost)
+library(Matrix)
+
+set.seed(123)
+```
+
+Antes de iniciar a análise, é importante compreender a estrutura do ficheiro *games.csv* e o significado das principais variáveis. Este dataset reúne informação de jogos de tabuleiro registados na plataforma BoardGameGeek (BGG), incluindo características do jogo (complexidade, duração, número de jogadores) e indicadores de avaliação e popularidade na comunidade.
+
+Origem do dataset: 
+
+https://www.kaggle.com/datasets/threnjen/board-games-database-from-boardgamegeek?resource=download 
+
+```{r}
+boardgames <- read.csv("games.csv", header = TRUE, stringsAsFactors = FALSE)
+glimpse(boardgames)
+```
+
+```{r}
+print("Dimensão do dataset:") 
+dim(boardgames)
+print("Nome das colunas: ")
+names(boardgames)
+```
+Após a importação, é analisada a dimensão do dataset (número de linhas e colunas) e confirmada a lista de variáveis disponíveis. Em termos gerais:
+
+- *BGGId* identifica unicamente cada jogo na BoardGameGeek.
+
+- *Name* e *Description* descrevem o jogo.
+
+- *YearPublished* indica o ano de publicação.
+
+- *GameWeight* (complexity) representa a complexidade/dificuldade média atribuída pela comunidade.
+
+- *AvgRating* (average_rating) é o rating médio do jogo (variável central do estudo).
+
+- *BayesAvgRating* é uma versão ajustada do rating, que reduz o efeito de poucos votos.
+
+- *MinPlayers* e *MaxPlayers* caracterizam o intervalo de jogadores.
+
+- *MfgPlayTime*, *ComMinPlaytime* e *ComMaxPlaytime* representam tempos de jogo (reportados pelo fabricante e/ou comunidade).
+
+- *NumOwned*, *NumWant*, *NumWish* e NumUserRatings refletem envolvimento/popularidade na comunidade (posse, interesse e número de ratings).
+
+- Rankings (Rank:...) e categorias (Cat:...) permitem contextualizar o jogo dentro de tipos específicos (estratégia, família, party, etc.).
+
+## Renomeação de colunas
+
+De modo a facilitar a leitura do código e a interpretação dos resultados, procedeu-se à renomeação das colunas, adotando nomes mais curtos, consistentes e semanticamente claros.
+
+```{r}
+rename_map <- c(
+  "BGGId"                = "id",
+  "Name"                 = "name",
+  "Description"          = "description",
+  "YearPublished"        = "year_published",
+  "GameWeight"           = "complexity",
+  "AvgRating"            = "average_rating",
+  "BayesAvgRating"       = "bayes_average_rating",
+  "StdDev"               = "rating_sd",
+  "MinPlayers"           = "min_players",
+  "MaxPlayers"           = "max_players",
+  "ComAgeRec"            = "age_recommended",
+  "LanguageEase"         = "language_dependence",
+  "BestPlayers"          = "best_players",
+  "GoodPlayers"          = "good_players",
+  "NumOwned"             = "num_owned",
+  "NumWant"              = "num_want",
+  "NumWish"              = "num_wish",
+  "NumWeightVotes"       = "num_weight_votes",
+  "MfgPlaytime"          = "playtime",
+  "ComMinPlaytime"       = "min_playtime",
+  "ComMaxPlaytime"       = "max_playtime",
+  "MfgAgeRec"            = "mfg_age_rec",
+  "NumUserRatings"       = "users_rated",
+  "NumComments"          = "num_comments",
+  "NumAlternates"        = "num_alternates",
+  "NumExpansions"        = "num_expansions",
+  "NumImplementations"   = "num_implementations",
+  "IsReimplementation"   = "is_reimplementation",
+  "Family"               = "family",
+  "Kickstarted"          = "kickstarted",
+  "ImagePath"            = "image_path",
+
+  # Rankings
+  "Rank.boardgame"       = "Rank.boardgame",
+  "Rank.strategygames"   = "Rank.strategygames",
+  "Rank.abstracts"       = "Rank.abstracts",
+  "Rank.familygames"     = "Rank.familygames",
+  "Rank.thematic"        = "Rank.thematic",
+  "Rank.cgs"             = "Rank.cgs",
+  "Rank.wargames"        = "Rank.wargames",
+  "Rank.partygames"      = "Rank.partygames",
+  "Rank.childrensgames"  = "Rank.childrensgames",
+
+  # Categories
+  "Cat.Thematic"         = "Cat.Thematic",
+  "Cat.Strategy"         = "Cat.Strategy",
+  "Cat.War"              = "Cat.War",
+  "Cat.Family"           = "Cat.Family",
+  "Cat.CGS"              = "Cat.CGS",
+  "Cat.Abstract"         = "Cat.Abstract",
+  "Cat.Party"            = "Cat.Party",
+  "Cat.Childrens"        = "Cat.Childrens"
+)
+
+names(boardgames) <- rename_map[names(boardgames)]
+
+```
+
+## Conversão de tipos de dados 
+
+Após a harmonização dos nomes das variáveis, foi realizada a conversão dos tipos de dados, assegurando que cada variável é representada de forma adequada (numérica, categórica ou lógica).
+
+```{r}
+
+tipos <- list(
+  character = c("name", "description", "family", "image_path", "best_players", "good_players"),
+  numeric = c("complexity", "average_rating", "bayes_average_rating", "rating_sd", "language_dependence"),
+  integer = c(
+    "id", "year_published", "min_players", "max_players",
+    "age_recommended", "num_owned", "num_want", "num_wish",
+    "num_weight_votes", "playtime", "min_playtime", "max_playtime",
+    "mfg_age_rec", "users_rated", "num_comments",
+    "num_alternates", "num_expansions", "num_implementations",
+    "Rank.boardgame", "Rank.strategygames", "Rank.abstracts",
+    "Rank.familygames", "Rank.thematic", "Rank.cgs",
+    "Rank.wargames", "Rank.partygames", "Rank.childrensgames"
+  ),
+  logical = c("kickstarted", "is_reimplementation"),
+  factor = c(
+    "Cat.Thematic", "Cat.Strategy", "Cat.War", "Cat.Family",
+    "Cat.CGS", "Cat.Abstract", "Cat.Party", "Cat.Childrens"
+  )
+)
+
+
+for (tipo in names(tipos)) {
+  for (col in tipos[[tipo]]) {
+
+    if (!col %in% names(boardgames)) next
+
+    if (tipo == "character") {
+      boardgames[[col]] <- as.character(boardgames[[col]])
+
+    } else if (tipo == "numeric") {
+      boardgames[[col]] <- as.numeric(boardgames[[col]])
+
+    } else if (tipo == "integer") {
+      boardgames[[col]] <- as.integer(boardgames[[col]])
+
+    } else if (tipo == "logical") {
+      boardgames[[col]] <- boardgames[[col]] == 1
+
+    } else if (tipo == "factor") {
+      boardgames[[col]] <- as.factor(boardgames[[col]])
+    }
+  }
+}
+
+for (col in names(boardgames)) {
+  cat(col, ":", class(boardgames[[col]]), "\n")
+}
+```
+
+
+## Análise de valores em falta 
+
+Com os tipos de dados devidamente definidos, procedeu-se à análise da presença de valores em falta, com o objetivo de compreender a sua extensão e decidir a estratégia mais adequada para as fases seguintes.
+
+```{r}
+sort(colSums(is.na(boardgames)), decreasing = TRUE)[1:20]
+```
+As variáveis *language_dependence* e *age_recommended* apresentam um número elevado de valores em falta, uma vez que nem todos os jogos têm esta informação registada na BoardGameGeek.
+
+Na fase de Business Intelligence, os valores em falta foram mantidos e as análises foram realizadas apenas sobre os valores observados, de forma a preservar a distribuição real dos dados e evitar a introdução de enviesamentos artificiais.
+
+```{r}
+summary(boardgames$language_dependence)
+summary(boardgames$age_recommended)
+```
+```{r}
+ggplot(boardgames, aes(language_dependence)) +
+  geom_histogram(bins = 40, na.rm = TRUE) +
+  labs(title = "Distribuição da dependência de linguagem")
+
+ggplot(boardgames, aes(age_recommended)) +
+  geom_histogram(bins = 30, na.rm = TRUE) +
+  labs(title = "Distribuição da idade recomendada")
+```
+
+# Preparação e criação de variáveis derivadas
+
+Nesta etapa foi realizada uma verificação de consistência temporal e a criação de variáveis derivadas para apoiar a análise exploratória (**BI**) e as fases posteriores de Business Analytics (**BA**).
+
+Deste modo, foi aplicado um filtro de plausibilidade temporal, restringindo *year_published* ao intervalo entre 1900 e o ano atual, de forma a excluir eventuais entradas inconsistentes.
+
+```{r}
+summary(boardgames$year_published)
+boardgames <- boardgames[boardgames$year_published >= 1900 & boardgames$year_published <= 2025, ]
+```
+De seguida, foram criadas várias variáveis derivadas:
+
+*avg_playtime*, que estima a duração média de um jogo a partir dos tempos mínimo e máximo reportados;
+
+*player_range*, definido como a diferença entre o número máximo e mínimo de jogadores, permitindo avaliar a flexibilidade do jogo quanto ao tamanho do grupo;
+
+*is_modern*, um indicador binário que distingue jogos modernos (publicados a partir de 2000) de jogos mais antigos;
+
+*is_top_game*, uma variável binária criada a partir de average_rating, utilizada posteriormente em tarefas de classificação, considerando como “jogos de topo” aqueles com classificação média igual ou superior a 8.
+
+Estas transformações não alteram os valores originais do dataset, servindo apenas para enriquecer a análise e facilitar a interpretação dos resultados nas etapas seguintes.
+
+```{r}
+
+boardgames$avg_playtime <- (boardgames$min_playtime + boardgames$max_playtime) / 2
+
+boardgames$player_range <- boardgames$max_players - boardgames$min_players
+
+boardgames$is_modern <- ifelse(boardgames$year_published >= 2000, 1, 0)
+
+boardgames$is_top_game <- ifelse(boardgames$average_rating >= 8, 1, 0)
+
+dim(boardgames)
+head(boardgames[, c("year_published", "avg_playtime", "player_range", "is_modern", "is_top_game")])
+
+```
+
+# Análise Univariada
+
+A análise univariada tem como objetivo compreender a distribuição individual de cada variável, identificando padrões gerais, assimetrias e possíveis valores extremos, sem considerar ainda relações entre variáveis.
+
+## Rating Médio
+
+A variável *average_rating* representa a avaliação média atribuída pela comunidade a cada jogo. É a variável central desta análise, pois serve como indicador global de qualidade percebida e será também utilizada nas fases preditivas.
+
+```{r}
+summary(boardgames$average_rating)
+hist(boardgames$average_rating, breaks=40,
+     main="Distribuição do rating médio",
+     xlab="Rating Médio")
+```
+
+O histograma sugere que a comunidade de jogadores de tabuleiros tende a avaliar a maioria dos jogos como “bons”(ratings entre 6 e 8), sendo relativamente raros tanto os jogos muito mal avaliados como os verdadeiramente excecionais. O rating médio parece, portanto, um indicador estável e adequado para análises comparativas.
+
+```{r}
+top10_rating <- boardgames[
+  order(boardgames$average_rating, decreasing = TRUE),
+  c("name", "average_rating", "year_published")
+][1:10, ]
+
+top10_rating
+```
+
+## Complexidade do jogo
+
+A variável *complexity* (GameWeight) mede o grau de complexidade/dificuldade do jogo, refletindo o esforço necessário para aprender regras e tomar decisões. Esta variável é importante para perceber se jogos mais “pesados” tendem a ser avaliados de forma diferente.
+
+```{r}
+summary(boardgames$complexity)
+hist(boardgames$complexity, breaks=40,
+     main="Distribuição da complexidade do jogo",
+     xlab="Grau de complexidade")
+```
+
+A maioria dos jogos concentram-se em niveis de complexidade baixos a médios (entre 1 a 3). O que sugere  uma preferência geral por jogos acessíveis, mas com alguma profundidade estratégica.
+
+```{r}
+top10_complexity <- boardgames[
+  order(boardgames$complexity, decreasing = TRUE),
+  c("name", "complexity", "average_rating", "year_published")
+][1:10, ]
+
+top10_complexity
+
+```
+
+
+## Tempo médio por jogo
+
+A variável *avg_playtime* estima a duração média de uma partida, calculada a partir dos tempos mínimo e máximo reportados.
+
+```{r}
+summary(boardgames$avg_playtime)
+xlim <- quantile(boardgames$avg_playtime, 0.98, na.rm = TRUE)
+hist(boardgames$avg_playtime[boardgames$avg_playtime <= xlim], breaks=40,
+     main="Distribuição do tempo médio por jogo ",
+     xlab="Tempo médio (min)")
+```
+
+Os dados indicam que jogos curtos e de duração moderada são muito mais comuns do que jogos longos. Jogos muito extensos existem, mas representam uma pequena fração do total, possivelmente direcionados a jogadores mais dedicados.
+
+```{r}
+
+top10_playtime <- boardgames[!is.na(boardgames$avg_playtime), ]
+
+top10_playtime <- top10_playtime[
+  order(top10_playtime$avg_playtime, decreasing = TRUE),
+  c("name", "avg_playtime", "complexity", "year_published")
+][1:10, ]
+
+top10_playtime
+
+```
+
+## Idade recomendada
+
+A variável *age_recommended* indica a idade mínima recomendada pela comunidade para jogar o jogo. Esta informação ajuda a caracterizar o público-alvo (infantil, familiar ou mais adulto) e o nível de acessibilidade.
+
+```{r}
+summary(boardgames$age_recommended)
+hist(boardgames$age_recommended, breaks=25,
+     main="Distribuição da idade recomendada",
+     xlab="Idade recomendada")
+```
+
+A maioria dos jogos é pensada para públicos jovens ou familiares, sendo acessível a partir da pré-adolescência. Jogos especificamente dirigidos a adultos existem, mas não dominam o conjunto de dados.
+
+## Dependência de linguagem
+
+A variável *language_dependence* representa o grau de dependência do jogo em relação à linguagem, isto é, o quanto a leitura e compreensão de texto são essenciais para a sua jogabilidade. Esta informação é fornecida pela comunidade da BoardGameGeek através de votações.
+
+No dataset utilizado, este indicador surge como um valor agregado, refletindo a intensidade da dependência linguística combinada com o número de utilizadores que contribuíram para a avaliação.
+
+```{r}
+summary(boardgames$language_dependence)
+xlim <- quantile(boardgames$language_dependence, 0.98, na.rm = TRUE)
+hist(boardgames$language_dependence[boardgames$language_dependence <= xlim], breaks=40,
+     main="Dependência de linguagem",
+     xlab="language_dependence")
+```
+
+Através da análise do histograma, verifica-se que grande parte dos jogos requer pouca leitura ou compreensão linguística, o que facilita a sua acessibilidade a diferentes públicos e idiomas. No entanto, existe um subconjunto menor de jogos fortemente baseados em texto, possivelmente jogos narrativos ou de maior complexidade temática.
+
+# Evolução temporal 
+
+Após analisar as características individuais dos jogos, torna-se relevante observar a evolução do mercado ao longo do tempo, identificando tendências no número de lançamentos anuais.
+
+```{r}
+anos <- table(boardgames$year_published)
+
+anos_df <- data.frame(
+  year = as.numeric(names(anos)),
+  n_jogos = as.numeric(anos)
+)
+
+anos_df <- anos_df[order(anos_df$year), ]
+
+plot(anos_df$year, anos_df$n_jogos, type = "l",
+     main = "Número de jogos publicados por ano",
+     xlab = "Ano de publicação",
+     ylab = "Número de jogos")
+
+```
+
+O gráfico evidencia uma expansão progressiva do número de jogos de tabuleiro publicados ao longo do tempo. Durante grande parte do século XX, o número de lançamentos anuais foi reduzido e relativamente estável, refletindo um mercado mais limitado e com menor diversidade de oferta.
+
+A partir do final do século XX, e de forma mais marcada após o ano 2000, observa-se um aumento consistente no número de jogos publicados por ano. Este crescimento poderá estar relacionado com a consolidação dos jogos de tabuleiro modernos e com o maior envolvimento da comunidade de jogadores, bem como com a melhoria dos mecanismos de divulgação e registo de informação em plataformas especializadas como a BoardGameGeek.
+
+A ligeira redução observada nos anos mais recentes poderá dever-se a efeitos de atraso no registo dos jogos, a impactos externos, por exemplo, pandemia.
+
+
+# Análise Bivariada 
+
+A análise bivariada permite investigar relações entre pares de variáveis, avaliando se determinadas características dos jogos estão associadas a classificações mais elevadas.
+
+## Complexidade vs Rating
+
+Nesta análise pretende-se avaliar se o grau de complexidade de um jogo está associado à sua classificação média. Em particular, procura-se responder à questão (**BI**): jogos mais complexos tendem a ser melhor avaliados pela comunidade?
+
+```{r}
+plot(boardgames$complexity, boardgames$average_rating,
+     pch = 16,
+     col = "darkgray", 
+     xlab = "Complexidade",
+     ylab = "Rating médio",
+     main = "Complexidade vs Rating")
+
+abline(lm(average_rating ~ complexity, data = boardgames),
+       col = "black", lwd = 4)
+
+
+```
+```{r}
+cor.test(boardgames$complexity,
+         boardgames$average_rating,
+         method = "spearman",
+         use = "complete.obs")
+
+```
+
+O gráfico sugere que jogos mais complexos tendem, em média, a apresentar classificações um pouco mais elevadas. Ainda assim, a relação não é forte, sendo visível uma grande dispersão de valores para todos os níveis de complexidade.
+
+A tendência observada é reforçada pela análise estatística através da correlação de Spearman, que demonstra uma correlação positiva moderada entre a complexidade do jogo e o rating médio, com um valor-p inferior a 0.001, o que mostra que esta associação dificilmente ocorre por acaso.
+
+Apesar disso, a complexidade, por si só, não garante uma boa avaliação. Ela parece estar associada a uma tendência geral para ratings mais elevados, possivelmente porque jogos mais complexos atraem um público mais experiente ou especializado. Por outro lado, jogos mais simples podem apresentar tanto avaliações muito altas como muito baixas, refletindo preferências mais diversificadas entre os jogadores.
+
+Após analisar a relação entre complexidade e classificação média, torna-se pertinente explorar se outras características do jogo, como a duração ou o número de jogadores, apresentam padrões semelhantes em relação ao rating.
+
+## Popularidade vs Rating
+
+Nesta análise pretende-se avaliar se a popularidade de um jogo, medida pelo número de utilizadores que o possuem (*num_owned*), está associada à sua classificação média. A questão central é (**BI**): jogos mais populares tendem a ser melhor avaliados pela comunidade?
+
+
+```{r}
+plot(boardgames$num_owned, boardgames$average_rating,
+     pch = 16, col = "gray",
+     xlab = "Número de utilizadores que possuem o jogo",
+     ylab = "Rating médio",
+     main = "Popularidade vs Rating")
+
+cor.test(boardgames$num_owned,
+         boardgames$average_rating,
+         method = "spearman",
+         use = "complete.obs")
+
+```
+
+O gráfico de dispersão evidencia uma tendência positiva entre o número de utilizadores que possuem o jogo e o respetivo rating médio. No entanto, observa-se uma elevada dispersão dos pontos, especialmente para valores mais baixos de popularidade.
+
+A análise estatística através da correlação de Spearman confirma esta observação, indicando uma correlação positiva fraca a moderada (ρ = 0.29), estatisticamente significativa (p-value < 0.001). Este resultado sugere que jogos mais populares tendem, em média, a apresentar classificações ligeiramente superiores.
+
+## Tempo médio vs Rating 
+
+Nesta análise pretende-se investigar a relação entre a duração média de um jogo e a sua avaliação. O objetivo é responder à questão (**BI**): jogos mais longos tendem, em média, a apresentar classificações superiores aos jogos mais curtos?
+
+```{r}
+
+lim <- quantile(boardgames$avg_playtime, 0.98, na.rm = TRUE)
+
+idx <- boardgames$avg_playtime <= lim
+
+plot(boardgames$avg_playtime[idx],
+     boardgames$average_rating[idx],
+     pch = 16, col = "darkgray",
+     xlab = "Tempo médio (min)",
+     ylab = "Rating médio",
+     main = "Tempo médio vs Rating")
+
+abline(lm(average_rating ~ avg_playtime,
+          data = boardgames[idx, ]),
+       col = "black", lwd = 4)
+
+```
+```{r}
+cor.test(boardgames$avg_playtime,
+         boardgames$average_rating,
+         method = "spearman",
+         use = "complete.obs")
+
+```
+
+O gráfico sugere que jogos com maior duração tendem, em média, a apresentar classificações ligeiramente superiores. No entanto, a relação entre o tempo médio de jogo e o rating é fraca, evidenciando que a duração, por si só, não é um fator determinante da avaliação dos jogos.
+
+O mesmo é confirmado pela análise estatística que indica uma correlação positiva fraca a moderada entre o tempo médio de jogo e o rating, sendo estatisticamente significativa (valor-p inferior a 0.001).
+
+Jogos curtos podem ser muito bem avaliados ou mal avaliados, refletindo preferências diversas dos jogadores, enquanto jogos mais longos parecem atrair um público mais específico.
+
+## Nº de jogadores vs Rating
+
+Nesta análise pretende-se analisar se o número de jogadores recomendado influencia a classificação média dos jogos. Em particular, procura-se responder à questão (**BI**): existe uma faixa de número de jogadores associada a ratings mais elevados?
+
+```{r}
+
+group_size <- ifelse(boardgames$max_players <= 2, "Até 2",
+                ifelse(boardgames$max_players <= 4, "3-4",
+                ifelse(boardgames$max_players <= 6, "5-6", "7+")))
+
+group_size <- factor(group_size,
+                     levels = c("Até 2", "3-4", "5-6", "7+"))
+
+boxplot(boardgames$average_rating ~ group_size,
+        main = "Rating por faixa de jogadores",
+        xlab = "Faixa de jogadores",
+        ylab = "Rating médio",
+        col = "lightgray")
+
+
+```
+```{r}
+kruskal.test(boardgames$average_rating ~ group_size)
+```
+
+A análise do boxplot indica que as distribuições de rating são muito semelhantes entre as diferentes faixas de jogadores. As medianas, a dispersão interquartil e a extensão dos valores são comparáveis, sugerindo que o número de jogadores recomendado não tem um impacto forte e evidente na classificação média dos jogos.
+
+Para complementar esta análise visual, foi aplicado o teste estatístico de Kruskal–Wallis, adequado à comparação de mais de dois grupos sem assumir normalidade das distribuições. O teste indica a existência de diferenças estatisticamente significativas entre pelo menos duas das faixas de jogadores (valor-p inferior a 0.001).
+
+No entanto, apesar da significância estatística, as diferenças observadas entre as distribuições são pequenas do ponto de vista prático. Em particular, observa-se apenas uma ligeira diferença na mediana dos jogos destinados a até dois jogadores, que apresentam valores marginalmente superiores. Estas diferenças não são suficientemente marcadas para afirmar que o número de jogadores, por si só, seja um fator determinante da avaliação dos jogos.
+
+De forma geral, os resultados indicam que jogos bem ou mal avaliados existem em todas as faixas de jogadores, reforçando a ideia de que o rating depende de múltiplos fatores e não apenas do tamanho do grupo.
+
+## Ano de publicação vs Rating
+
+Nesta análise pretende-se estudar a relação entre o ano de publicação dos jogos e o respetivo rating médio. O objetivo é responder à questão (**BI**): jogos mais recentes tendem a ser melhor avaliados do que jogos mais antigos?
+
+```{r}
+plot(boardgames$year_published, boardgames$average_rating,
+     pch = 16,
+     col = "gray",
+     xlab = "Ano de publicação",
+     ylab = "Rating médio",
+     main = "Ano de publicação vs Rating")
+
+abline(lm(average_rating ~ year_published, data = boardgames),
+       col = "black", lwd = 4)
+```
+```{r}
+cor.test(boardgames$year_published,
+         boardgames$average_rating,
+         method = "spearman",
+         use = "complete.obs")
+
+```
+
+O gráfico sugere uma tendência positiva entre o ano de publicação dos jogos e o respetivo rating médio, indicando que jogos mais recentes tendem, em média, a apresentar classificações ligeiramente superiores.
+
+A mesma tendência é verificada na análise estatística que indica uma correlação positiva moderada entre o ano de publicação e o rating médio, sendo estatisticamente significativa (valor-p inferior a 0.001).
+
+Logo, jogos publicados mais recentemente tendem a ser melhor avaliados, possivelmente refletindo melhorias no design, maior maturidade da indústria e expectativas mais alinhadas com o público atual. No entanto, a dispersão observada ao longo de todo o período indica que jogos bem ou mal avaliados existem em todas as épocas, pelo que o ano de publicação, por si só, não determina a qualidade percebida de um jogo.
+
+## Jogos modernos vs clássicos
+
+Nesta análise pretende-se comparar a classificação média dos jogos clássicos e modernos, avaliando se o período de publicação está associado a diferenças no rating médio. Para este efeito, os jogos foram classificados como clássicos (publicados antes de 2000) e modernos (publicados a partir de 2000).
+
+```{r}
+boxplot(average_rating ~ is_modern,
+        data = boardgames,
+        names = c("Clássicos", "Modernos"),
+        main = "Rating médio: jogos clássicos vs modernos",
+        ylab = "Rating médio",
+        col = "lightgray")
+
+wilcox.test(average_rating ~ is_modern, data = boardgames)
+
+```
+
+O boxplot evidencia que os jogos modernos apresentam, em média, classificações ligeiramente superiores às dos jogos clássicos. Observa-se também uma maior concentração de ratings elevados nos jogos modernos, enquanto os jogos clássicos apresentam maior dispersão e um número mais elevado de outliers com ratings baixos.
+
+Para validar esta observação, foi aplicado o teste não paramétrico de Wilcoxon, adequado à comparação de duas distribuições independentes sem assumir normalidade. O teste indica uma diferença estatisticamente significativa entre os dois grupos (p-value < 0.001).
+
+Estes resultados sugerem que jogos publicados mais recentemente tendem a ser melhor avaliados pela comunidade, possivelmente refletindo melhorias no design, maior diversidade temática e uma maior maturidade da indústria de jogos de tabuleiro.
+
+# Análise Multivariada
+
+De modo a identificar padrões globais e relações entre múltiplas características dos jogos, foi construída uma matriz de correlação entre as principais variáveis numéricas do dataset. 
+
+```{r}
+num_vars <- boardgames[, c(
+  "average_rating", "bayes_average_rating", "rating_sd",
+  "complexity", "avg_playtime",
+  "min_players", "max_players", "player_range",
+  "year_published",
+  "num_owned", "num_want", "num_wish", "num_weight_votes",
+  "language_dependence", "age_recommended"
+)]
+m_corr <- cor(num_vars, use = "pairwise.complete.obs")
+corrplot(m_corr,
+         method = "square",
+         tl.cex = 0.7,
+         tl.srt = 45)
+
+```
+
+A matriz de correlação mostra que o rating médio está associado a vários fatores, destacando-se a forte relação com o rating Bayesiano. A complexidade e o ano de publicação apresentam correlações positivas moderadas com o rating, enquanto o tempo médio de jogo, a dependência de linguagem e a idade recomendada têm impacto reduzido.
+
+As variáveis relacionadas com popularidade e envolvimento da comunidade (*num_owned*, *num_want*, *num_wish* e *num_weight_votes*) estão fortemente correlacionadas entre si, sugerindo que jogos mais populares tendem a concentrar maior interação dos utilizadores. No geral, os resultados indicam que a avaliação dos jogos depende de múltiplos fatores e não de uma única característica isolada.
+
+# Redução dimensional (PCA)
+
+Após identificar relações relevantes entre várias variáveis numéricas, torna-se pertinente aplicar uma técnica de redução de dimensão, como a Análise de Componentes Principais (PCA), com o objetivo de sintetizar a informação e explorar padrões globais no conjunto de jogos.
+
+```{r}
+pca_vars <- boardgames[, c(
+  "complexity", "avg_playtime",
+  "min_players", "max_players", "player_range",
+  "year_published",
+  "num_owned", "num_want", "num_wish", "num_weight_votes"
+)]
+
+pca_vars <- pca_vars[complete.cases(pca_vars), ]
+
+
+pca <- prcomp(scale(pca_vars), center = TRUE, scale. = TRUE)
+summary(pca)
+
+
+fviz_pca_ind(pca, geom = "point", alpha = 0.3) +
+  ggtitle("PCA (features numéricas)")
+
+```
+
+A Análise de Componentes Principais permitiu reduzir a dimensionalidade dos dados, mostrando que os dois primeiros componentes explicam cerca de 54% da variância total. Enquanto que com quatro componentes é possível representar aproximadamente 77% da informação original, indicando alguma redundância entre as variáveis.
+
+A projeção dos jogos no espaço definido pelos dois primeiros componentes não revela grupos claramente separados, mas sim uma distribuição contínua, com alguns outliers. Assim, a PCA confirma a relação entre as variáveis e é útil como ferramenta exploratória para síntese dos dados.
+
+# Clustering de jogos 
+
+Complementarmente à PCA, foi aplicada uma técnica de clustering com o objetivo de identificar perfis distintos de jogos, agrupando-os com base em características semelhantes.
+
+```{r}
+cluster_vars <- boardgames[, c(
+  "complexity",
+  "avg_playtime",
+  "min_players",
+  "max_players",
+  "year_published",
+  "num_owned",
+  "num_weight_votes"
+)]
+cluster_vars <- na.omit(cluster_vars)
+cluster_scaled <- scale(cluster_vars)
+wss <- numeric(10)
+
+for (k in 1:10) {
+  set.seed(123)
+  km <- kmeans(cluster_scaled, centers = k, nstart = 25)
+  wss[k] <- km$tot.withinss
+}
+
+plot(1:10, wss, type = "b",
+     xlab = "Número de clusters (k)",
+     ylab = "Within-cluster sum of squares",
+     main = "Método do cotovelo para escolha de k")
+
+```
+```{r}
+set.seed(123)
+km_bg <- kmeans(cluster_scaled, centers = 3, nstart = 25)
+cluster_vars <- as.data.frame(cluster_vars)
+cluster_vars$cluster <- factor(km_bg$cluster)
+table(cluster_vars$cluster)
+cluster_summary <- aggregate(cluster_vars[, -ncol(cluster_vars)],
+                            by = list(Cluster = cluster_vars$cluster),
+                            mean)
+
+cluster_summary
+
+```
+
+A aplicação do algoritmo k-means permitiu identificar três perfis distintos de jogos com base em várias características numéricas. O primeiro cluster agrupa jogos simples, de curta duração e baixa complexidade, geralmente direcionados a um público mais amplo e casual. O segundo cluster corresponde a jogos de complexidade intermédia e duração moderada, destacando-se pela elevada popularidade junto da comunidade. Por fim, o terceiro cluster reúne jogos mais longos e complexos, tipicamente concebidos para grupos mais pequenos e um público mais experiente.
+
+Esta segmentação evidencia a diversidade de perfis existentes no conjunto de dados e complementa as análises exploratórias anteriores, mostrando que jogos com características bastante distintas coexistem no mercado.
+
+
+# Business Analytics Preditiva
+
+Após a fase exploratória, procede-se à construção de modelos preditivos, com o objetivo de estimar o rating médio dos jogos e classificar jogos de topo com base nas suas características.
+
+## Previsão do rating médio
+
+```{r}
+reg_vars <- boardgames[, c(
+  "average_rating", "complexity", "avg_playtime",
+  "min_players", "max_players", "player_range",
+  "year_published",
+  "num_owned", "num_want", "num_wish",
+  "num_weight_votes", "is_modern"
+)]
+
+reg_vars <- reg_vars[complete.cases(reg_vars), ]
+
+set.seed(123)
+n <- nrow(reg_vars)
+idx <- sample(1:n, size = 0.8*n)
+
+train <- reg_vars[idx, ]
+test  <- reg_vars[-idx, ]
+
+
+rf_reg <- randomForest(average_rating ~ ., data = train, ntree = 300)
+pred <- predict(rf_reg, newdata = test)
+
+
+mae <- mean(abs(test$average_rating - pred))
+r2 <- 1 - sum((test$average_rating - pred)^2) /
+           sum((test$average_rating - mean(test$average_rating))^2)
+print("MAE:")
+mae
+print("R^2:")
+r2
+
+
+plot(test$average_rating, pred,
+     pch = 16, col = "gray",
+     xlab = "Rating real",
+     ylab = "Rating previsto",
+     main = "Regressão: Real vs Previsto")
+abline(0,1,col="black",lwd=2)
+
+```
+O modelo de regressão apresenta um erro absoluto médio de aproximadamente 0.42, indicando que, em média, as previsões diferem do valor real do rating em menos de meio ponto. O valor de R² = 0.60 mostra que o modelo consegue explicar cerca de 60% da variabilidade observada nos ratings.
+
+O gráfico de comparação entre valores reais e previstos evidencia uma tendência geral bem capturada pelo modelo, com os pontos distribuídos em torno da linha de referência. No entanto, observa-se alguma dispersão, sobretudo para jogos com ratings mais baixos e mais elevados, indicando que o modelo tem maior dificuldade em prever valores extremos.
+
+Embora o modelo de Random Forest apresente um desempenho razoável, existe ainda variabilidade significativa por explicar. De modo a avaliar se um modelo alternativo consegue capturar melhor padrões não lineares nos dados, foi testado um segundo modelo de regressão, permitindo uma comparação direta de desempenho.
+
+```{r}
+reg_vars <- boardgames[, c(
+  "average_rating", "complexity", "avg_playtime",
+  "min_players", "max_players", "player_range",
+  "year_published", "num_owned", "num_want", "num_wish",
+  "num_weight_votes", "is_modern"
+)]
+
+reg_vars <- reg_vars[complete.cases(reg_vars), ]
+
+set.seed(123)
+idx <- sample(seq_len(nrow(reg_vars)), size = 0.8*nrow(reg_vars))
+
+train_xgb <- reg_vars[idx, ]
+test_xgb  <- reg_vars[-idx, ]
+
+y_train <- train_xgb$average_rating
+y_test  <- test_xgb$average_rating
+
+X_train <- model.matrix(~ . -1, data = train_xgb[, setdiff(names(train_xgb), "average_rating")])
+X_test  <- model.matrix(~ . -1, data = test_xgb[,  setdiff(names(test_xgb),  "average_rating")])
+
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dtest  <- xgb.DMatrix(data = X_test,  label = y_test)
+
+params <- list(
+  objective = "reg:squarederror",
+  eta = 0.05,
+  max_depth = 6,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+xgb_model <- xgb.train(params = params, data = dtrain, nrounds = 300, verbose = 0)
+pred_xgb <- predict(xgb_model, dtest)
+
+mae_xgb <- mean(abs(y_test - pred_xgb))
+r2_xgb  <- 1 - sum((y_test - pred_xgb)^2) / sum((y_test - mean(y_test))^2)
+
+print("MAE:")
+mae_xgb
+print("R^2:")
+r2_xgb
+
+plot(y_test, pred_xgb,
+     pch=16, col="gray",
+     xlab="Rating real", ylab="Rating previsto",
+     main="XGBoost: Real vs Previsto")
+abline(0,1,lwd=2)
+```
+A introdução de um modelo mais sofisticado (XGBoost) não resultou numa melhoria substancial face ao Random Forest. Ambos os modelos apresentam valores muito semelhantes de MAE e R², indicando que a limitação principal não está no algoritmo, mas sim na informação disponível nas variáveis explicativas.
+
+## Previsão da classificação
+
+```{r}
+cls_vars <- boardgames[, c(
+  "is_top_game", "complexity", "avg_playtime",
+  "min_players", "max_players", "player_range",
+  "year_published",
+  "num_owned", "num_want", "num_wish",
+  "num_weight_votes", "is_modern"
+)]
+
+cls_vars <- cls_vars[complete.cases(cls_vars), ]
+
+cls_vars$is_top_game <- factor(cls_vars$is_top_game, levels = c(0,1))
+
+
+set.seed(123)
+n <- nrow(cls_vars)
+idx <- sample(1:n, size = 0.8*n)
+
+train <- cls_vars[idx, ]
+test  <- cls_vars[-idx, ]
+
+rf_cls <- randomForest(is_top_game ~ ., data = train, ntree = 400)
+
+prob <- predict(rf_cls, newdata = test, type = "prob")[, "1"]
+pred <- ifelse(prob >= 0.5, 1, 0)
+
+confusionMatrix(factor(pred), test$is_top_game)
+
+roc_obj <- roc(test$is_top_game, prob)
+plot(roc_obj, main = "ROC - is_top_game")
+auc(roc_obj)
+
+```
+O desempenho do modelo de classificação foi avaliado através da matriz de confusão e da curva ROC. A curva ROC apresenta uma área sob a curva elevada (AUC = 0.92), indicando que o modelo possui uma excelente capacidade para distinguir jogos de topo dos restantes quando analisadas as probabilidades previstas.
+
+No entanto, a análise da matriz de confusão revela um forte desbalanceamento entre as classes. Embora o modelo apresente uma accuracy elevada, este valor é influenciado pela predominância de jogos não classificados como topo. A sensibilidade para a classe “top” é relativamente baixa, o que indica que apenas uma parte reduzida dos jogos de topo é corretamente identificada.
+
+Em conjunto, estes resultados mostram que o modelo é eficaz a identificar jogos não-topo e a ordenar jogos por probabilidade de sucesso, mas menos eficaz na deteção direta de jogos de topo. 
+
+# Análise Prescriptiva - Recomendação de jogo 
+
+Após a análise descritiva e preditiva, procede-se à vertente prescritiva da Business Analytics. Enquanto as abordagens anteriores permitiram compreender padrões existentes nos dados e estimar resultados futuros, a análise prescritiva tem como objetivo apoiar decisões concretas, respondendo à questão “o que deve ser feito?”.
+
+Neste contexto, foi desenvolvido um sistema simples de recomendação de jogos de tabuleiro, baseado na similaridade de características dos jogos. A partir de um jogo de referência, o modelo sugere jogos com perfis semelhantes em termos de complexidade, duração, número de jogadores e indicadores de popularidade. Esta abordagem ilustra como os dados podem ser utilizados para apoiar decisões de recomendação personalizadas.
+
+```{r}
+
+rec_vars <- boardgames[, c(
+  "id", "name",
+  "complexity", "avg_playtime",
+  "min_players", "max_players",
+  "year_published",
+  "num_owned", "num_want", "num_wish",
+  "num_weight_votes",
+  "average_rating"
+)]
+
+
+rec_vars <- rec_vars[complete.cases(rec_vars), ]
+
+
+X <- as.matrix(rec_vars[, c(
+  "complexity","avg_playtime","min_players","max_players",
+  "year_published","num_owned","num_want","num_wish","num_weight_votes"
+)])
+
+
+X <- scale(X)
+
+recommend <- function(game_name, k = 15) {
+
+  i <- which(tolower(rec_vars$name) == tolower(game_name))[1]
+
+  if (is.na(i)) {
+    stop("Jogo não encontrado no dataset.")
+  }
+
+  v <- X[i, ]
+
+  dot <- as.vector(X %*% v)
+  normX <- sqrt(rowSums(X^2))
+  normV <- sqrt(sum(v^2))
+  sims <- dot / (normX * normV)
+
+  sims[i] <- -1
+
+  top <- order(sims, decreasing = TRUE)[1:k]
+
+  result <- rec_vars[top, c("name", "average_rating")]
+  result$similarity <- round(sims[top], 3)
+
+
+  result <- result[order(result$similarity, decreasing = TRUE), ]
+  rownames(result) <- NULL
+
+
+  cat("JOGO DE REFERÊNCIA:\n")
+  cat("   ", rec_vars$name[i], 
+      "(Rating médio:", round(rec_vars$average_rating[i], 2), ")\n")
+
+
+  cat("TOP", k, "JOGOS RECOMENDADOS:\n\n")
+
+  for (j in 1:nrow(result)) {
+    cat(sprintf(
+      "%2d. %-40s | Rating: %.2f | Similaridade: %.3f\n",
+      j,
+      result$name[j],
+      result$average_rating[j],
+      result$similarity[j]
+    ))
+  }
+
+
+  return(result)
+}
+
+```
+
+Para exemplificar a análise prescritiva, optei por utilizar os jogos *Catan*, *Wingspan* e *Risk*, que estão entre os meus jogos de tabuleiro preferidos. Estes jogos apresentam estilos e categorias distintas, desde jogos de estratégia e gestão mais acessíveis, como *Catan* e *Wingspan*, até um jogo clássico de controlo de território e confronto direto, como *Risk*.
+
+A escolha destes títulos permite avaliar se o sistema de recomendação é capaz de sugerir jogos com experiências semelhantes, adaptando as recomendações ao perfil de cada jogo de referência, mesmo quando pertencem a categorias diferentes.
+
+
+```{r}
+recommend("Catan", 10)
+```
+```{r}
+recommend("Risk", 10)
+```
+```{r}
+recommend("Wingspan", 10)
+```
+
+# Conclusão
+
+De forma geral, este trabalho mostrou que o dataset da BoardGameGeek permite extrair informação relevante sobre o mercado de jogos de tabuleiro, tanto numa perspetiva exploratória como analítica. A análise de Business Intelligence evidenciou padrões claros, como a predominância de jogos de complexidade baixa a média, o aumento do número de lançamentos nas últimas décadas e associações moderadas entre o *average_rating*, a *complexity* e o *year_published*.
+
+Na vertente de Business Analytics, os modelos preditivos demonstraram desempenho razoável na estimação do average_rating, captando tendências globais, embora uma parte importante da variabilidade permaneça por explicar. Este resultado é esperado, pois as avaliações são subjetivas e dependem de fatores não observáveis no dataset (preferências individuais, contexto de jogo e popularidade). Na tarefa de classificação (*is_top_game*), o modelo apresentou boa capacidade discriminativa quando analisadas as probabilidades (AUC elevada), mas a interpretação da accuracy deve ser feita com cautela devido ao desbalanceamento entre classes, o que dificulta a deteção direta da classe minoritária.
+
+Por fim, a análise prescritiva mostrou que é possível construir um sistema simples de recomendação baseado em conteúdo, utilizando apenas características numéricas dos jogos, e obter sugestões coerentes para perfis distintos. Ainda assim, a viabilidade prática destes resultados depende da qualidade e representatividade dos dados: existem variáveis com valores em falta, potenciais enviesamentos da plataforma (apenas jogos registados e avaliados por utilizadores da BGG) e possíveis atrasos no registo de jogos recentes. No conjunto, o trabalho evidencia que a combinação de BI e BA aplicada a dados reais é útil para compreender padrões e apoiar decisões, desde que os resultados sejam interpretados com sentido crítico e com consciência das limitações do dataset e das métricas utilizadas.
